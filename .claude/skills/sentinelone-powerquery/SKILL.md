@@ -95,17 +95,17 @@ When the user describes a hunt in natural language and you're unsure of the righ
 
 Don't read these upfront. Read the one you need.
 
-- `references/syntax-and-operators.md` — full operator reference, identifier rules, shortcut fields, regex dialect, date/time formats, short-circuit `||`.
-- `references/commands-reference.md` — deep dive on every command (join variants, subqueries, lookup / dataset / savelookup, transpose, compare, top, nolimit). Read before writing anything non-trivial with join, transpose, or compare.
-- `references/functions-reference.md` — all built-in functions: string, numeric, JSON, network, URL, aggregate, array (method chaining), geolocation, timestamp, time, string-formatting. Read when you need a function and can't remember the name.
-- `references/fields-and-schema.md` — common EDR/XDR field paths (`src.process.*`, `tgt.file.*`, `event.login.*`, `dst.ip.*`, `indicator.*`, etc.) and OCSF conventions. Read when you're not sure what field holds the thing you want.
-- `references/detection-rules.md` — how to author PowerQuery Alerts / STAR / Custom Detection rule bodies, including the 1,000-row / 1 MB alert constraints and which PQ features are supported in alert context.
-- `references/pitfalls.md` — curated list of common failures and their fixes (the `*`-as-filter trap, forgetting `|` before `join`, subquery position errors, memory-limit messages, etc.).
+- `shared/sentinelone-powerquery/references/syntax-and-operators.md` — full operator reference, identifier rules, shortcut fields, regex dialect, date/time formats, short-circuit `||`.
+- `shared/sentinelone-powerquery/references/commands-reference.md` — deep dive on every command (join variants, subqueries, lookup / dataset / savelookup, transpose, compare, top, nolimit). Read before writing anything non-trivial with join, transpose, or compare.
+- `shared/sentinelone-powerquery/references/functions-reference.md` — all built-in functions: string, numeric, JSON, network, URL, aggregate, array (method chaining), geolocation, timestamp, time, string-formatting. Read when you need a function and can't remember the name.
+- `shared/sentinelone-powerquery/references/fields-and-schema.md` — common EDR/XDR field paths (`src.process.*`, `tgt.file.*`, `event.login.*`, `dst.ip.*`, `indicator.*`, etc.) and OCSF conventions. Read when you're not sure what field holds the thing you want.
+- `shared/sentinelone-powerquery/references/detection-rules.md` — how to author PowerQuery Alerts / STAR / Custom Detection rule bodies, including the 1,000-row / 1 MB alert constraints and which PQ features are supported in alert context.
+- `shared/sentinelone-powerquery/references/pitfalls.md` — curated list of common failures and their fixes (the `*`-as-filter trap, forgetting `|` before `join`, subquery position errors, memory-limit messages, etc.).
 
 ## Examples library — read when a hunt matches
 
-- `examples/investigations.md` — ready-to-run investigation queries (PowerShell outbound, suspicious cmdline patterns, lateral movement, LOLBins, credential access, defense evasion, user-activity baselines, endpoint heartbeat, indicator prevalence). Each example includes a brief "what this finds" note and the full PQ.
-- `examples/detection-library.md` — PQ bodies ready to paste into a STAR / Custom Detection / PowerQuery Alert, sized to stay within the 1,000-row/1 MB alert budget. Each entry names the MITRE technique and gives a `threshold` suggestion.
+- `shared/sentinelone-powerquery/examples/investigations.md` — ready-to-run investigation queries (PowerShell outbound, suspicious cmdline patterns, lateral movement, LOLBins, credential access, defense evasion, user-activity baselines, endpoint heartbeat, indicator prevalence). Each example includes a brief "what this finds" note and the full PQ.
+- `shared/sentinelone-powerquery/examples/detection-library.md` — PQ bodies ready to paste into a STAR / Custom Detection / PowerQuery Alert, sized to stay within the 1,000-row/1 MB alert budget. Each entry names the MITRE technique and gives a `threshold` suggestion.
 
 ## When to reach for join vs union vs subquery
 
@@ -127,7 +127,7 @@ A PowerQuery used as a detection rule body (STAR / Custom Detection / PowerQuery
 - The rule should produce one row per finding, with stable columns the detection engine can map to alert fields (e.g., `agent.uuid`, `endpoint.name`, `src.process.storyline.id`, `timestamp`).
 - Keep the initial filter as specific as possible — this is what's evaluated in the summary service and is what gates cost.
 
-For detection rule patterns and a checklist, see `references/detection-rules.md` and `examples/detection-library.md`.
+For detection rule patterns and a checklist, see `shared/sentinelone-powerquery/references/detection-rules.md` and `shared/sentinelone-powerquery/examples/detection-library.md`.
 
 ## A minimal but realistic example
 

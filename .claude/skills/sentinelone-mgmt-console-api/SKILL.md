@@ -9,7 +9,7 @@ Wraps the SentinelOne Management Console API (Swagger 2.0, spec version 2.1, 781
 
 ## Setup — configure credentials first
 
-Credentials live in `config.json` at the skill root. Users update two fields:
+Credentials live in `config.json` at `shared/sentinelone-mgmt-console-api/`. Copy `config.json.example` and fill in:
 
 ```json
 {
@@ -22,26 +22,28 @@ The `base_url` is the user's tenant console URL (no trailing slash, no `/web/api
 
 Environment variables override the file: `S1_BASE_URL`, `S1_API_TOKEN`, `S1_VERIFY_TLS`.
 
-Before running anything, confirm `config.json` has been filled in. If the placeholder strings are still present, stop and ask the user to update them.
+Before running anything, confirm `shared/sentinelone-mgmt-console-api/config.json` has been filled in. If the placeholder strings are still present, stop and ask the user to update them.
 
 ## Workflow
 
 When the user asks for something involving the S1 API, follow this pattern:
 
-1. **Find the right endpoint.** Use `scripts/search_endpoints.py` with a keyword matching the user's intent. This returns method + path + tag + summary. If the result set is large, narrow with `--tag` (e.g. `Threats`, `Agents`, `Sites`).
-2. **Read the per-tag reference.** Open `references/tags/<Tag>.md` (names match the table in `references/TAG_INDEX.md`) to see full parameter lists, descriptions, required permissions, and response codes for that group. Only read the tag file(s) relevant to the task — don't read them all.
-3. **Call the endpoint.** Either use `scripts/call_endpoint.py` for one-off calls, or import `S1Client` from `scripts/s1_client.py` in a Python script for anything that needs loops, joins, or transforms.
+1. **Find the right endpoint.** Use `shared/sentinelone-mgmt-console-api/scripts/search_endpoints.py` with a keyword matching the user's intent. This returns method + path + tag + summary. If the result set is large, narrow with `--tag` (e.g. `Threats`, `Agents`, `Sites`).
+2. **Read the per-tag reference.** Open `shared/sentinelone-mgmt-console-api/references/tags/<Tag>.md` (names match the table in `shared/sentinelone-mgmt-console-api/references/TAG_INDEX.md`) to see full parameter lists, descriptions, required permissions, and response codes for that group. Only read the tag file(s) relevant to the task — don't read them all.
+3. **Call the endpoint.** Either use `shared/sentinelone-mgmt-console-api/scripts/call_endpoint.py` for one-off calls, or import `S1Client` from `shared/sentinelone-mgmt-console-api/scripts/s1_client.py` in a Python script for anything that needs loops, joins, or transforms.
 4. **Paginate correctly.** S1 list endpoints use cursor-based pagination. The client's `paginate()` and `iter_items()` handle this automatically — prefer them over manual `skip`/`limit` math, which caps at 1000 items.
 5. **Summarize the result for the user.** Don't dump raw JSON unless asked. Prefer a short prose summary plus a table or CSV/XLSX if the volume warrants.
 
 ## Files in this skill
 
+All resources live under `shared/sentinelone-mgmt-console-api/`:
+
 - `config.json` — credentials (user updates these).
 - `scripts/s1_client.py` — importable Python client. Handles auth, retries on 429/5xx, pagination.
-- `scripts/call_endpoint.py` — CLI for one-shot calls: `python scripts/call_endpoint.py GET /web/api/v2.1/agents --param limit=5`.
-- `scripts/search_endpoints.py` — keyword search over the endpoint index: `python scripts/search_endpoints.py "isolate"`.
+- `scripts/call_endpoint.py` — CLI for one-shot calls: `python shared/sentinelone-mgmt-console-api/scripts/call_endpoint.py GET /web/api/v2.1/agents --param limit=5`.
+- `scripts/search_endpoints.py` — keyword search over the endpoint index: `python shared/sentinelone-mgmt-console-api/scripts/search_endpoints.py "isolate"`.
 - `scripts/purple_ai.py` — Purple AI natural-language wrapper over `POST /web/api/v2.1/graphql` (undocumented endpoint). Exports `purple_query()` and `PurpleAIError`.
-- `scripts/call_purple.py` — CLI wrapper: `python scripts/call_purple.py "show powershell.exe outbound connections"`.
+- `scripts/call_purple.py` — CLI wrapper: `python shared/sentinelone-mgmt-console-api/scripts/call_purple.py "show powershell.exe outbound connections"`.
 - `references/TAG_INDEX.md` — table of all 113 tags with file pointers and op counts. Start here when you don't know which tag owns an endpoint.
 - `references/endpoint_index.json` — compact machine-readable index (one entry per op). Used by `search_endpoints.py` but can be read directly if you need to filter programmatically.
 - `references/tags/<Tag>.md` — per-tag reference with parameters, descriptions, and required permissions. Load only the files you need.
@@ -52,7 +54,7 @@ When the user asks for something involving the S1 API, follow this pattern:
 
 ```python
 import sys
-sys.path.insert(0, "scripts")  # or set PYTHONPATH
+sys.path.insert(0, "shared/sentinelone-mgmt-console-api/scripts")  # or set PYTHONPATH
 from s1_client import S1Client, S1APIError
 
 c = S1Client()
@@ -92,7 +94,7 @@ Auth is identical to REST — the same `Authorization: ApiToken <token>` header.
 
 ```python
 import sys
-sys.path.insert(0, "scripts")
+sys.path.insert(0, "shared/sentinelone-mgmt-console-api/scripts")
 from s1_client import S1Client
 from purple_ai import purple_query, PurpleAIError
 
@@ -117,10 +119,10 @@ else:
 CLI equivalent:
 
 ```
-python scripts/call_purple.py "show powershell.exe outbound connections, top 10"
-python scripts/call_purple.py --selector CLOUD --hours 48 "show s3 downloads by user"
-python scripts/call_purple.py --json "..."   # machine-readable normalized result
-python scripts/call_purple.py --raw  "..."   # full GraphQL response
+python shared/sentinelone-mgmt-console-api/scripts/call_purple.py "show powershell.exe outbound connections, top 10"
+python shared/sentinelone-mgmt-console-api/scripts/call_purple.py --selector CLOUD --hours 48 "show s3 downloads by user"
+python shared/sentinelone-mgmt-console-api/scripts/call_purple.py --json "..."   # machine-readable normalized result
+python shared/sentinelone-mgmt-console-api/scripts/call_purple.py --raw  "..."   # full GraphQL response
 ```
 
 ### Purple AI's domain boundary — important
