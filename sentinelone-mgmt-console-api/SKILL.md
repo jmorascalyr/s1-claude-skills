@@ -1,6 +1,6 @@
 ---
 name: sentinelone-mgmt-console-api
-description: Use this skill whenever the user wants to query or act on a SentinelOne Management Console — threats, alerts, agents, sites, accounts, groups, exclusions, firewall, device control, RemoteOps, Deep Visibility, Hyperautomation, or any other S1 Mgmt API resource. Trigger on mentions of "SentinelOne", "S1", "S1 console", "Singularity", "/web/api/v2.1/...", S1 agent IDs, threat IDs, site IDs, account IDs, or requests like "list my endpoints", "get threats from the last 24h", "isolate an endpoint", "disconnect agent", "run RemoteOps script", "pull DV query results". Also trigger when the user asks to build reports, run bulk actions, or automate anything involving a SentinelOne tenant. The skill wraps the full S1 Mgmt Console API (781 operations across 113 tags, spec v2.1) with a ready-to-use Python client, cursor-based pagination, and a searchable endpoint index.
+description: Use this skill whenever the user wants to query or act on a SentinelOne Management Console — threats, alerts, agents, sites, accounts, groups, exclusions, firewall, device control, RemoteOps, Deep Visibility, Hyperautomation, Purple AI, or any other S1 Mgmt API resource. Trigger on mentions of "SentinelOne", "S1", "S1 console", "Singularity", "Purple AI", "/web/api/v2.1/...", S1 agent IDs, threat IDs, site IDs, account IDs, or requests like "list my endpoints", "get threats from the last 24h", "isolate an endpoint", "disconnect agent", "run RemoteOps script", "pull DV query results", or "ask Purple AI a natural-language question". Also trigger when the user asks to build reports, run bulk actions, or automate anything involving a SentinelOne tenant. The skill wraps the full S1 Mgmt Console API (781 operations across 113 tags, spec v2.1) with a ready-to-use Python client, cursor-based pagination, a searchable endpoint index, and a Purple AI natural-language wrapper over the undocumented GraphQL endpoint.
 ---
 
 # SentinelOne Management Console API
@@ -40,6 +40,8 @@ When the user asks for something involving the S1 API, follow this pattern:
 - `scripts/s1_client.py` — importable Python client. Handles auth, retries on 429/5xx, pagination.
 - `scripts/call_endpoint.py` — CLI for one-shot calls: `python scripts/call_endpoint.py GET /web/api/v2.1/agents --param limit=5`.
 - `scripts/search_endpoints.py` — keyword search over the endpoint index: `python scripts/search_endpoints.py "isolate"`.
+- `scripts/purple_ai.py` — Purple AI natural-language wrapper over `POST /web/api/v2.1/graphql` (undocumented endpoint). Exports `purple_query()` and `PurpleAIError`.
+- `scripts/call_purple.py` — CLI wrapper: `python scripts/call_purple.py "show powershell.exe outbound connections"`.
 - `references/TAG_INDEX.md` — table of all 113 tags with file pointers and op counts. Start here when you don't know which tag owns an endpoint.
 - `references/endpoint_index.json` — compact machine-readable index (one entry per op). Used by `search_endpoints.py` but can be read directly if you need to filter programmatically.
 - `references/tags/<Tag>.md` — per-tag reference with parameters, descriptions, and required permissions. Load only the files you need.
@@ -82,11 +84,72 @@ Many endpoints are destructive or operationally sensitive: disconnect/reconnect 
 
 The safe pattern: run the matching `GET` with `countOnly=true` first to show the blast radius, then the mutating call.
 
+## Purple AI — natural-language query
+
+SentinelOne exposes an undocumented GraphQL endpoint at `POST /web/api/v2.1/graphql` that powers the console's Purple AI chat. The skill wraps the `purpleLaunchQuery` operation so workflows can ask Purple AI in natural language and receive a structured response (summary text plus a generated PowerQuery).
+
+Auth is identical to REST — the same `Authorization: ApiToken <token>` header. No extra credential setup beyond `config.json`.
+
+```python
+import sys
+sys.path.insert(0, "scripts")
+from s1_client import S1Client
+from purple_ai import purple_query, PurpleAIError
+
+c = S1Client()
+try:
+    r = purple_query(
+        c,
+        "Show powershell.exe processes making outbound connections in the last 24h, top 10.",
+        view_selector="EDR",   # EDR | IDENTITY | CLOUD | NGFW | DATA_LAKE
+        hours=24,
+    )
+except PurpleAIError as e:
+    # entitlement or permission failure — the token's role can't use Purple AI,
+    # or the tenant isn't entitled. These return HTTP 200 with an in-body error.
+    print(f"purple error: {e} (type={e.error_type})")
+else:
+    print(r["message"])           # natural-language answer
+    print(r["power_query"])       # generated PQ (may be None — see below)
+    print(r["suggested_questions"])
+```
+
+CLI equivalent:
+
+```
+python scripts/call_purple.py "show powershell.exe outbound connections, top 10"
+python scripts/call_purple.py --selector CLOUD --hours 48 "show s3 downloads by user"
+python scripts/call_purple.py --json "..."   # machine-readable normalized result
+python scripts/call_purple.py --raw  "..."   # full GraphQL response
+```
+
+### Purple AI's domain boundary — important
+
+Purple AI answers questions about **SDL telemetry**: process events, network events, file events, indicators, and ingested third-party logs. It does **not** answer questions about **console entities** — alerts, threats, agents, sites, policies. Those are REST resources; use the matching REST endpoint (e.g. `GET /web/api/v2.1/threats`, `GET /web/api/v2.1/cloud-detection/alerts`) instead.
+
+Out-of-domain questions return HTTP 200 with `result_type: "MESSAGE"` and a scope refusal like *"Purple can query for threat indicators, OS events, and some third-party vendor logs ingested into the Singularity Data Lake."* — this is Purple's own guardrail, not a skill failure. When the user's ask is about an entity and Purple refuses, switch to the REST path and tell them why.
+
+### Interpreting the response
+
+Key fields in the normalized dict:
+
+- `result_type`: `"POWER_QUERY"` means Purple generated an executable PQ (check `power_query`). `"MESSAGE"` means docs/RAG mode — `message` has the answer, `power_query` will be None.
+- `state`: `"COMPLETED"` is the successful path. Any other state is unexpected.
+- `power_query`: the PQ Purple generated. Do **not** auto-execute it without showing it to the user first — Purple can hallucinate fields and execution has a tenant cost. Prefer: render it → confirm with user → then run it through the existing DV/PowerQuery endpoints.
+- `suggested_questions`: the "you might also ask" chips from the UI.
+
+### Caveats
+
+- The GraphQL endpoint is **undocumented** and not a committed public API. Field names, schema, and behavior can change between console releases. Flag this when building anything production-grade on top.
+- Entitlement and permission failures come back as HTTP 200 with `status.error` populated. The wrapper raises `PurpleAIError` on these so they don't masquerade as empty results — surface the `error_type` to the user verbatim (it's the best hint we have for "re-issue the token with Purple AI permission" vs "the tenant isn't licensed for Purple").
+- `teamToken` and `accountId` in the request body are UI-session artifacts; empty strings are accepted for API-token auth.
+
 ## Common high-value workflows
 
 - **Threat triage** — `GET /threats` filtered by `createdAt__gte` + `resolved=false`; enrich with agent details from `/agents?ids=...`; output a table.
 - **Endpoint isolation** — find agent IDs (`/agents` with name/IP filter), confirm count, `POST /agents/actions/disconnect` with filter.
 - **Hunt across DV** — `POST /dv/init-query` → poll `/dv/query-status/{queryId}` → `GET /dv/events`.
+- **Natural-language hunt via Purple AI** — `purple_query(c, "...")` → review the generated PQ → execute via DV/PowerQuery. Only for SDL-telemetry questions; route entity questions to REST.
 - **Site/Group inventory** — `/sites`, `/groups`, `/accounts` are the tenant-structure endpoints; many resources require filtering by `siteIds` / `accountIds`.
 - **Bulk action audit** — `/activities` is the system-wide audit log; filter by `activityTypes` and `createdAt__gte`.
 

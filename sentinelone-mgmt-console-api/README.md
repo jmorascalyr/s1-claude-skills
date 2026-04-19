@@ -1,6 +1,6 @@
 # sentinelone-mgmt-console-api (Claude skill)
 
-A Claude skill wrapping the SentinelOne Management Console API (Swagger 2.1, 781 operations, 113 tags).
+A Claude skill wrapping the SentinelOne Management Console API (Swagger 2.1, 781 operations, 113 tags) plus a natural-language wrapper over the console's undocumented Purple AI GraphQL endpoint.
 
 ## Install
 
@@ -41,10 +41,22 @@ python scripts/s1_client.py
 
 Should print the first 5 accounts.
 
+Purple AI natural-language query (requires tenant entitlement for Purple AI):
+
+```bash
+python scripts/call_purple.py "show powershell.exe outbound connections in the last 24h, top 10"
+```
+
+Purple AI answers questions about SDL telemetry (process/network/file events, indicators, ingested logs). It does *not* answer questions about console entities (alerts, threats, agents) — those go through the REST endpoints.
+
 ## Layout
 
 - `SKILL.md` — instructions Claude reads when the skill triggers
-- `config.json` — credentials (gitignore this)
-- `scripts/` — Python client + CLI helpers
+- `config.json` — credentials (gitignore this; `config.json.example` is the template)
+- `scripts/s1_client.py` — REST client (auth, retries, cursor pagination)
+- `scripts/call_endpoint.py` — REST CLI wrapper
+- `scripts/search_endpoints.py` — keyword search over the endpoint index
+- `scripts/purple_ai.py` — Purple AI GraphQL wrapper (`purple_query()`, `PurpleAIError`)
+- `scripts/call_purple.py` — Purple AI CLI wrapper
 - `references/` — endpoint index + per-tag reference docs
 - `spec/` — the original Swagger JSON
