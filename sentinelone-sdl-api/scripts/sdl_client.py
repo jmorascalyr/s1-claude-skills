@@ -1,0 +1,552 @@
+"""
+SentinelOne Singularity Data Lake (SDL) API client.
+
+The SDL API has four scoped key types plus console user API tokens. Each
+method below picks the correct key automatically; callers do not need to
+worry about which token to send.
+
+Credential resolution order (env wins over config.json):
+  SDL_BASE_URL            -> base_url  (e.g. https://xdr.us1.sentinelone.net)
+  SDL_LOG_WRITE_KEY       -> log_write_key     (uploadLogs, addEvents)
+  SDL_LOG_READ_KEY        -> log_read_key      (query/numeric/facet/timeseries/powerQuery)
+  SDL_CONFIG_READ_KEY     -> config_read_key   (listFiles, getFile)
+  SDL_CONFIG_WRITE_KEY    -> config_write_key  (putFile and everything above)
+  SDL_CONSOLE_API_TOKEN   -> console_api_token (works for query methods; NOT uploadLogs)
+  SDL_S1_SCOPE            -> s1_scope          (required with console token when multi-site/account)
+  SDL_VERIFY_TLS          -> verify_tls        (default true)
+
+Usage:
+    from sdl_client import SDLClient
+    c = SDLClient()
+
+    # log write
+    c.upload_logs("hello from python", parser="uploadLogs", server_host="dev-box")
+    c.add_events(events=[{"ts": c.now_ns(), "attrs": {"message": "structured event", "app": "demo"}}])
+
+    # log read
+    c.power_query("dataset='accesslog' | group count() by status", start_time="1h")
+    c.query(filter="*", max_count=5, start_time="5m")
+
+    # config files
+    c.list_files()
+    c.get_file("/alerts")
+    c.put_file("/parsers/MyParser", content="// parser body")
+
+The client retries 429 and 5xx with exponential backoff and honours
+Retry-After. All responses are returned as parsed JSON dicts. Errors
+surface as SDLAPIError with .status and .body.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Union
+
+import requests
+
+
+SKILL_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = SKILL_DIR / "config.json"
+
+
+class SDLAPIError(RuntimeError):
+    def __init__(self, status: int, message: str, body: Any = None):
+        super().__init__(f"HTTP {status}: {message}")
+        self.status = status
+        self.body = body
+
+
+def _load_config() -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {}
+    if CONFIG_PATH.exists():
+        try:
+            cfg = json.loads(CONFIG_PATH.read_text())
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"config.json is not valid JSON: {e}")
+
+    env_map = {
+        "SDL_BASE_URL": "base_url",
+        "SDL_LOG_WRITE_KEY": "log_write_key",
+        "SDL_LOG_READ_KEY": "log_read_key",
+        "SDL_CONFIG_READ_KEY": "config_read_key",
+        "SDL_CONFIG_WRITE_KEY": "config_write_key",
+        "SDL_CONSOLE_API_TOKEN": "console_api_token",
+        "SDL_S1_SCOPE": "s1_scope",
+    }
+    for env, field in env_map.items():
+        if os.environ.get(env):
+            cfg[field] = os.environ[env]
+    if os.environ.get("SDL_VERIFY_TLS"):
+        cfg["verify_tls"] = os.environ["SDL_VERIFY_TLS"].lower() not in ("0", "false", "no")
+    return cfg
+
+
+class SDLClient:
+    """SDL API client. Picks the right token per method automatically."""
+
+    # --- key selection table -------------------------------------------------
+    # Read-log methods fall back: log_read -> config_read -> config_write -> console
+    # Log-write methods: log_write -> console (uploadLogs is console-incompatible)
+    # Config-read methods: config_read -> config_write -> console
+    # Config-write methods: config_write -> console
+    KEY_CHAINS = {
+        "log_read": ("log_read_key", "config_read_key", "config_write_key", "console_api_token"),
+        "log_write": ("log_write_key", "console_api_token"),  # console not valid for uploadLogs
+        "log_write_strict": ("log_write_key",),  # uploadLogs requires a real log-write key
+        "config_read": ("config_read_key", "config_write_key", "console_api_token"),
+        "config_write": ("config_write_key", "console_api_token"),
+    }
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        timeout: Optional[float] = None,
+        verify_tls: Optional[bool] = None,
+        **overrides: str,
+    ):
+        cfg = _load_config()
+        for k, v in overrides.items():
+            if v:
+                cfg[k] = v
+
+        self.base_url = (base_url or cfg.get("base_url") or "").rstrip("/")
+        if not self.base_url or "REPLACE-ME" in self.base_url:
+            raise RuntimeError(
+                "SDL base_url is not set. Edit config.json or export SDL_BASE_URL."
+            )
+
+        self.keys = {
+            "log_write_key": cfg.get("log_write_key") or "",
+            "log_read_key": cfg.get("log_read_key") or "",
+            "config_read_key": cfg.get("config_read_key") or "",
+            "config_write_key": cfg.get("config_write_key") or "",
+            "console_api_token": cfg.get("console_api_token") or "",
+        }
+        self.s1_scope = cfg.get("s1_scope") or ""
+        self.verify_tls = cfg.get("verify_tls", True) if verify_tls is None else verify_tls
+        self.timeout = timeout or cfg.get("timeout_seconds", 30)
+
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json"})
+
+    # ------------------------------------------------------------------ auth
+    def _pick_key(self, chain_name: str) -> str:
+        """Return the first configured key from the chain for this method."""
+        chain = self.KEY_CHAINS[chain_name]
+        for field in chain:
+            if self.keys.get(field):
+                return self.keys[field]
+        raise RuntimeError(
+            f"No API key configured for chain '{chain_name}'. Tried {chain}. "
+            "Check config.json."
+        )
+
+    def _auth_headers(self, chain_name: str, content_type: str = "application/json") -> Dict[str, str]:
+        token = self._pick_key(chain_name)
+        h = {"Authorization": f"Bearer {token}", "Content-Type": content_type}
+        # Console API tokens need S1-Scope when the user has access to multiple sites/accounts.
+        # We look up which field produced the token; only set the header if the token actually
+        # came from the console_api_token field AND a scope is configured.
+        if self.keys.get("console_api_token") == token and self.s1_scope:
+            h["S1-Scope"] = self.s1_scope
+        return h
+
+    # --------------------------------------------------------------- request
+    def _request(
+        self,
+        method: str,
+        path: str,
+        chain: str,
+        json_body: Optional[Any] = None,
+        data: Optional[Union[str, bytes]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+        content_type: str = "application/json",
+        retries: int = 3,
+    ) -> Dict[str, Any]:
+        if not path.startswith("/"):
+            path = "/" + path
+        url = self.base_url + path
+        headers = self._auth_headers(chain, content_type=content_type)
+        if extra_headers:
+            headers.update(extra_headers)
+
+        attempt = 0
+        while True:
+            attempt += 1
+            resp = self.session.request(
+                method.upper(),
+                url,
+                params=params,
+                json=json_body if data is None else None,
+                data=data,
+                headers=headers,
+                timeout=self.timeout,
+                verify=self.verify_tls,
+            )
+            status = resp.status_code
+            # Parse body once
+            try:
+                body: Any = resp.json() if resp.content else {}
+            except ValueError:
+                body = {"_raw": resp.text}
+
+            # SDL API treats 200 + status='error/server/backoff' as retryable.
+            sdl_status = body.get("status") if isinstance(body, dict) else None
+            retryable = (
+                status == 429
+                or 500 <= status < 600
+                or (sdl_status and isinstance(sdl_status, str) and sdl_status.startswith("error/server/backoff"))
+            )
+            if status < 400 and not (isinstance(sdl_status, str) and sdl_status.startswith("error/")):
+                return body
+            if retryable and attempt <= retries:
+                wait = min(2 ** attempt, 30)
+                ra = resp.headers.get("Retry-After")
+                if ra and ra.isdigit():
+                    wait = int(ra)
+                time.sleep(wait)
+                continue
+            # non-retryable failure
+            msg = ""
+            if isinstance(body, dict):
+                msg = body.get("message") or body.get("status") or ""
+            if not msg:
+                msg = resp.text[:500]
+            raise SDLAPIError(status, msg or f"status={sdl_status}", body)
+
+    # =========================================================================
+    # Log write
+    # =========================================================================
+    def upload_logs(
+        self,
+        content: Union[str, bytes],
+        parser: Optional[str] = None,
+        server_host: Optional[str] = None,
+        logfile: Optional[str] = None,
+        nonce: Optional[str] = None,
+        extra_server_fields: Optional[Dict[str, str]] = None,
+        content_type: str = "text/plain",
+    ) -> Dict[str, Any]:
+        """POST /api/uploadLogs — simple plain-text/raw upload.
+
+        `content` is sent as the raw request body. Newline-separated entries
+        become separate events. Body must be <= 6 MB; daily cap is 10 GB.
+
+        uploadLogs requires a real Log Write Access key — Console user API
+        tokens are NOT accepted for this endpoint.
+        """
+        headers: Dict[str, str] = {}
+        if parser:
+            headers["parser"] = parser
+        if server_host:
+            headers["server-host"] = server_host
+        if logfile:
+            headers["logfile"] = logfile
+        if nonce:
+            headers["Nonce"] = nonce
+        if extra_server_fields:
+            for k, v in extra_server_fields.items():
+                # "server-{value}" convention (e.g. server-region)
+                key = k if k.lower().startswith("server-") else f"server-{k}"
+                headers[key] = v
+
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        return self._request(
+            "POST",
+            "/api/uploadLogs",
+            chain="log_write_strict",
+            data=data,
+            content_type=content_type,
+            extra_headers=headers,
+        )
+
+    def add_events(
+        self,
+        events: List[Dict[str, Any]],
+        session: Optional[str] = None,
+        session_info: Optional[Dict[str, Any]] = None,
+        threads: Optional[List[Dict[str, str]]] = None,
+        logs: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """POST /api/addEvents — structured event ingestion.
+
+        `session` MUST be stable per upload process (a UUID generated at
+        startup). One in-flight request per session; keep throughput near
+        2.5 MB/s per session, 10 MB/s max, 50K sessions per 5-min window.
+
+        Every event needs `ts` (nanoseconds since epoch, as a STRING to
+        avoid float precision loss) and `attrs` (object). `sev` defaults
+        to 3 (info).
+        """
+        if not events:
+            raise ValueError("events must be a non-empty list")
+        body: Dict[str, Any] = {
+            "session": session or str(uuid.uuid4()),
+            "events": events,
+        }
+        if session_info:
+            body["sessionInfo"] = session_info
+        if threads:
+            body["threads"] = threads
+        if logs:
+            body["logs"] = logs
+        return self._request("POST", "/api/addEvents", chain="log_write", json_body=body)
+
+    # =========================================================================
+    # Log read (queries)
+    # =========================================================================
+    def query(
+        self,
+        filter: str = "",
+        start_time: Optional[Union[str, int]] = None,
+        end_time: Optional[Union[str, int]] = None,
+        max_count: int = 100,
+        page_mode: Optional[str] = None,
+        columns: Optional[str] = None,
+        continuation_token: Optional[str] = None,
+        priority: Optional[str] = None,
+        team_emails: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """POST /api/query — retrieve log events matching `filter`.
+
+        `filter` uses the same syntax as the UI search bar. Escape double
+        quotes with \\". `start_time`/`end_time` accept UI time strings
+        ("1h", "24h", "10/27 4 PM") or epoch seconds/ms/ns. Omit both to
+        default to the last 24h.
+
+        `max_count` range is 1..5000 (default 100). Use `continuation_token`
+        to page beyond max_count — reuse the same query params and pin
+        start/end to absolute times to avoid drift.
+        """
+        body: Dict[str, Any] = {"queryType": "log", "maxCount": max_count}
+        if filter:
+            body["filter"] = filter
+        if start_time is not None:
+            body["startTime"] = start_time
+        if end_time is not None:
+            body["endTime"] = end_time
+        if page_mode:
+            body["pageMode"] = page_mode
+        if columns:
+            body["columns"] = columns
+        if continuation_token:
+            body["continuationToken"] = continuation_token
+        if priority:
+            body["priority"] = priority
+        if team_emails:
+            body["teamEmails"] = team_emails
+        return self._request("POST", "/api/query", chain="log_read", json_body=body)
+
+    def numeric_query(
+        self,
+        function: str = "count",
+        filter: str = "",
+        start_time: Union[str, int] = "1h",
+        end_time: Optional[Union[str, int]] = None,
+        buckets: int = 1,
+        priority: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /api/numericQuery — bucketed numeric/graph data.
+
+        Effectively superseded by timeseriesQuery, but offers sub-30s
+        buckets and is permitted for roles that cannot run
+        timeseriesQuery. `function` can be 'count', 'rate', or an
+        aggregation like 'mean(responseSize)'.
+        """
+        body: Dict[str, Any] = {
+            "queryType": "numeric",
+            "function": function,
+            "startTime": start_time,
+            "buckets": buckets,
+        }
+        if filter:
+            body["filter"] = filter
+        if end_time is not None:
+            body["endTime"] = end_time
+        if priority:
+            body["priority"] = priority
+        return self._request("POST", "/api/numericQuery", chain="log_read", json_body=body)
+
+    def facet_query(
+        self,
+        field: str,
+        filter: str = "",
+        start_time: Union[str, int] = "1h",
+        end_time: Optional[Union[str, int]] = None,
+        max_count: int = 100,
+        priority: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """POST /api/facetQuery — top-N values of `field` in matching events.
+
+        `max_count` range is 1..1000 (default 100). For very large result
+        sets, returned values are sampled from at least 500K matching
+        events.
+        """
+        body: Dict[str, Any] = {
+            "queryType": "facet",
+            "field": field,
+            "startTime": start_time,
+            "maxCount": max_count,
+        }
+        if filter:
+            body["filter"] = filter
+        if end_time is not None:
+            body["endTime"] = end_time
+        if priority:
+            body["priority"] = priority
+        return self._request("POST", "/api/facetQuery", chain="log_read", json_body=body)
+
+    def timeseries_query(
+        self,
+        queries: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """POST /api/timeseriesQuery — one or more numeric queries.
+
+        Each entry in `queries` may include: filter, function, startTime,
+        endTime, buckets, createSummaries, onlyUseSummaries, priority,
+        teamEmails, tenant, accountIds. Creating a summary turns repeat
+        matching queries into near-instant lookups after backfill (~2
+        months/hour).
+        """
+        if not queries:
+            raise ValueError("queries must be a non-empty list")
+        return self._request(
+            "POST", "/api/timeseriesQuery", chain="log_read", json_body={"queries": queries}
+        )
+
+    def power_query(
+        self,
+        query: str,
+        start_time: Optional[Union[str, int]] = None,
+        end_time: Optional[Union[str, int]] = None,
+        priority: Optional[str] = None,
+        team_emails: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """POST /api/powerQuery — full pipeline query language.
+
+        `query` is limited to 10,000 chars; escape " in strings. Omit
+        times for default 24h. Response has matchingEvents, omittedEvents,
+        columns, values (array of rows).
+        """
+        body: Dict[str, Any] = {"query": query}
+        if start_time is not None:
+            body["startTime"] = start_time
+        if end_time is not None:
+            body["endTime"] = end_time
+        if priority:
+            body["priority"] = priority
+        if team_emails:
+            body["teamEmails"] = team_emails
+        return self._request("POST", "/api/powerQuery", chain="log_read", json_body=body)
+
+    # =========================================================================
+    # Configuration files
+    # =========================================================================
+    def list_files(self) -> Dict[str, Any]:
+        """POST /api/listFiles — list every configuration file path."""
+        return self._request("POST", "/api/listFiles", chain="config_read", json_body={})
+
+    def get_file(
+        self,
+        path: str,
+        expected_version: Optional[int] = None,
+        prettyprint: bool = False,
+    ) -> Dict[str, Any]:
+        """POST /api/getFile — read a configuration file.
+
+        If `expected_version` matches the stored version, status is
+        'success/unchanged' and no content is returned.
+        """
+        body: Dict[str, Any] = {"path": path}
+        if expected_version is not None:
+            body["expectedVersion"] = expected_version
+        if prettyprint:
+            body["prettyprint"] = True
+        return self._request("POST", "/api/getFile", chain="config_read", json_body=body)
+
+    def put_file(
+        self,
+        path: str,
+        content: Optional[str] = None,
+        expected_version: Optional[int] = None,
+        prettyprint: bool = False,
+        delete: bool = False,
+    ) -> Dict[str, Any]:
+        """POST /api/putFile — create, update, or delete a config file.
+
+        Pass `delete=True` to delete. Otherwise `content` is required;
+        content is validated per file type (e.g. dashboards expect
+        '{graphs: []}' for an empty file, parsers/datatables expect "").
+        """
+        body: Dict[str, Any] = {"path": path}
+        if expected_version is not None:
+            body["expectedVersion"] = expected_version
+        if delete:
+            body["deleteFile"] = True
+        else:
+            if content is None:
+                raise ValueError("content required unless delete=True")
+            body["content"] = content
+            if prettyprint:
+                body["prettyprint"] = True
+        return self._request("POST", "/api/putFile", chain="config_write", json_body=body)
+
+    # =========================================================================
+    # Helpers
+    # =========================================================================
+    @staticmethod
+    def now_ns() -> str:
+        """Current epoch nanoseconds as a string (safe for addEvents.ts)."""
+        return str(time.time_ns())
+
+    @staticmethod
+    def new_session_id() -> str:
+        """Generate a UUID suitable for addEvents.session."""
+        return str(uuid.uuid4())
+
+    def iter_query(
+        self,
+        filter: str = "",
+        start_time: Union[str, int] = "24h",
+        end_time: Optional[Union[str, int]] = None,
+        page_size: int = 1000,
+        max_total: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Iterable[Dict[str, Any]]:
+        """Yield every match for a /api/query call across continuationToken pages.
+
+        Use absolute epoch times on the first call if you want perfect
+        stability across pages; relative times ('1h') still work because
+        the client carries them into subsequent calls.
+        """
+        token: Optional[str] = None
+        yielded = 0
+        while True:
+            resp = self.query(
+                filter=filter,
+                start_time=start_time,
+                end_time=end_time,
+                max_count=page_size,
+                continuation_token=token,
+                **kwargs,
+            )
+            matches = resp.get("matches") or []
+            for m in matches:
+                yield m
+                yielded += 1
+                if max_total and yielded >= max_total:
+                    return
+            token = resp.get("continuationToken")
+            if not token or not matches:
+                return
+
+
+if __name__ == "__main__":
+    # Smoke test — list configuration files.
+    c = SDLClient()
+    print(json.dumps(c.list_files(), indent=2)[:2000])
