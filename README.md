@@ -17,6 +17,15 @@ Drop a skill folder into your Claude skills directory (for Claude Code / Cowork,
 OR
 Clone and zip the folder, upload the skill to Claude Cowork. Note: the sentinelone-mgmt-console-api and sentinelone-sdl-api need a valid config.json - ensure you use it responsibly with an RO token, plan and validate actions before executing any changes. 
 
+## Windsurf
+
+This repo includes Windsurf workflow files in `.windsurf/workflows/`. Each workflow is a thin pointer that directs Cascade to read the canonical `SKILL.md` and reference docs in the matching skill folder — no duplicated content.
+
+- `sentinelone-api.md` — Management Console API (agents, threats, alerts, sites, Purple AI, UAM).
+- `sentinelone-powerquery.md` — PowerQuery authoring, debugging, and detection rules.
+- `sentinelone-sdl-api.md` — Singularity Data Lake API (ingest, query, config files).
+- `sentinelone-sdl-log-parser.md` — SDL log parser authoring with OCSF mapping.
+
 ## Configuration
 
 `sentinelone-mgmt-console-api` and `sentinelone-sdl-api` both need tenant credentials. Copy each example config and fill in your values:
