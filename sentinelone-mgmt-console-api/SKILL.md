@@ -309,7 +309,7 @@ Everything else in this skill talks to `<tenant>.sentinelone.net/web/api/v2.1/..
 **Endpoints:**
 
 - `POST /v1/indicators` -- raw behavioral indicators. Each must carry `metadata.profiles = ["s1/security_indicator"]` and a unique `metadata.uid` (this is the join key). Batching: send many indicators in one call by passing a list; the client concatenates + gzips.
-- `POST /v1/alerts` -- SecurityAlert wrappers. Each references its indicator(s) via `finding_info.related_events[].uid == indicator.metadata.uid`. A single alert can reference multiple indicators (one entry per indicator). The server stitches them into `alert.rawIndicators` / the UAM Indicators tab once both land.
+- `POST /v1/alerts` -- SecurityAlert wrappers. Each references its indicator(s) via `finding_info.related_events[].uid == indicator.metadata.uid`. A single alert can reference multiple indicators (one entry per indicator). The server stitches them into `alert.rawIndicators` / the UAM Indicators tab once both land. **Call with ONE alert per POST.** The wire format accepts multi-alert bodies and the gateway returns HTTP 202, but the stitcher silently drops all but one alert in a multi-alert batch (usea1-purple 2026-04-22); loop one at a time, or use `post_alert_with_indicators` which enforces the safe pattern.
 
 **Supported indicator classes (via builders):**
 
@@ -353,10 +353,13 @@ alert = build_alert_referencing(
     title="Ingested alert", description="...",
 )
 
-# One batched POST per resource; alert references both indicators via
-# finding_info.related_events[].uid.
-uam_iface.post_indicators([ind_a, ind_b], scope=f"{account_id}:{site_id}")
-uam_iface.post_alerts    ([alert],        scope=f"{account_id}:{site_id}")
+# Preferred safe path. Posts the indicators, sleeps 3s (so each
+# metadata.uid registers before the stitcher resolves related_events),
+# then posts the single alert. For many alerts, LOOP this call -- do
+# NOT pass multiple alerts to post_alerts() in one go (see constraints
+# below).
+uam_iface.post_alert_with_indicators(
+    alert, [ind_a, ind_b], scope=f"{account_id}:{site_id}")
 # Then poll UAM GraphQL (unified_alerts.list_alerts) to see it surface.
 ```
 
@@ -367,6 +370,23 @@ uam_iface.post_alerts    ([alert],        scope=f"{account_id}:{site_id}")
 **Multi-indicator alert constraints** (empirically confirmed on
 `usea1-purple` 2026-04-22):
 
+- **One alert per `POST /v1/alerts` call.** The wire format accepts
+  concatenated JSON for N alerts in one body and the gateway returns
+  HTTP 202, but the stitcher silently drops all but one of the alerts.
+  Callers with many alerts MUST loop. `post_alerts` emits a
+  `RuntimeWarning` when `len(alerts) > 1` to flag the hazard. Use
+  `post_alert_with_indicators(alert, indicators, ...)` for the safe
+  one-at-a-time path.
+- **Sleep between `POST /v1/indicators` and `POST /v1/alerts`.** If
+  the alert is posted immediately after its indicators, the stitcher
+  can resolve `finding_info.related_events[].uid` before the indicator's
+  `metadata.uid` is registered on the scope and silently drop the alert
+  (HTTP 202 still returned). A ~3s sleep between the two POSTs avoids
+  this; reducing below ~2s has been observed to regress on loaded
+  tenants. `post_alert_with_indicators` builds the sleep in; callers
+  using the low-level `post_indicators` + `post_alerts` path MUST add
+  it manually. `test_uam_alert_interface_batch.py` encodes this exact
+  sequence.
 - Alerts with multiple `resources[]` entries (i.e. indicators spanning
   different `device.uid` values) are silently dropped by the stitcher.
   Return: HTTP 202 at the wire, NEVER surfaces in UAM. The builder
@@ -418,6 +438,6 @@ See `tests/test_uam_alert_interface_single.py` for the minimum-viable worked exa
 - **Natural-language hunt via Purple AI** -- `purple_query(c, "...")` to generate a PQ, review, then execute via LRQ. Only for SDL-telemetry questions; route entity questions to REST.
 - **Site/Group inventory** — `/sites`, `/groups`, `/accounts` are the tenant-structure endpoints; many resources require filtering by `siteIds` / `accountIds`.
 - **Bulk action audit** — `/activities` is the system-wide audit log; filter by `activityTypes` and `createdAt__gte`.
-- **Push alerts + indicators INTO UAM** -- build OCSF payloads, `UAMAlertInterfaceClient.post_indicators([...])` then `.post_alerts([...])` (see "UAM Alert Interface" section above). Use for pipeline integrations, synthetic-alert generation, and detection testing.
+- **Push alerts + indicators INTO UAM** -- build OCSF payloads, then call `UAMAlertInterfaceClient.post_alert_with_indicators(alert, [...])` once per alert (loop for many). The helper posts indicators, sleeps 3s, and posts the single alert in the one sequence proven to surface cleanly on US1 tenants. See "UAM Alert Interface" section above for the two silent-drop failure modes (multi-alert POST, no sleep) it prevents. Use for pipeline integrations, synthetic-alert generation, and detection testing.
 
 Consult the per-tag reference files for exact parameter names — the above are orientation, not copy-paste ready.

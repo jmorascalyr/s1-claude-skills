@@ -47,9 +47,23 @@ reference many indicators by including multiple related_events entries
 
 Batching
 --------
-Both endpoints accept concatenated JSON: N indicators or N alerts in a
-single POST, back-to-back or newline-separated, gzip-compressed. The
-`_encode_batch` encoder handles it; callers just pass a list.
+POST /v1/indicators accepts N indicators per call (concatenated JSON,
+gzip-compressed); batching indicators is the idiomatic path.
+
+POST /v1/alerts is DIFFERENT. Empirically (usea1-purple 2026-04-22) the
+gateway accepts multi-alert bodies and returns HTTP 202, but the
+stitcher silently drops all but one of the alerts. Call /v1/alerts with
+ONE alert per invocation; loop if you have many. `post_alerts` emits a
+RuntimeWarning when called with more than one alert to flag the issue.
+
+Race condition between /v1/indicators and /v1/alerts
+----------------------------------------------------
+The stitcher resolves `finding_info.related_events[].uid` against the
+set of indicators already registered for the scope. Posting the alert
+immediately after the indicators can fire those lookups before the
+indicator's `metadata.uid` lands, which silently drops the alert
+(HTTP 202 still returned). A ~3s sleep between the two POSTs avoids
+this; the `post_alert_with_indicators` helper builds the sleep in.
 
 Usage
 -----
@@ -62,16 +76,27 @@ Usage
 
     mgmt = S1Client()
     uam  = UAMAlertInterfaceClient(bearer_token=mgmt.api_token)
+
+    # Preferred safe path: one helper call per alert. It POSTs the
+    # indicators, sleeps 3s, then POSTs the single alert.
+    uam.post_alert_with_indicators(alert, [ind1, ind2, ind3],
+                                   scope=f"{acct}:{site}")
+
+    # Low-level path (only if you need custom ordering). Remember: ONE
+    # alert per /v1/alerts call, and sleep between the two POSTs.
     uam.post_indicators([ind1, ind2, ind3], scope=f"{acct}:{site}")
-    uam.post_alerts([alert_linking_all_three],  scope=f"{acct}:{site}")
+    time.sleep(3)
+    uam.post_alerts([alert_linking_all_three], scope=f"{acct}:{site}")
 """
 from __future__ import annotations
 
 import gzip
 import json
 import os
+import time
 import urllib.error
 import urllib.request
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -252,7 +277,7 @@ class UAMAlertInterfaceClient:
 
     def post_alerts(self, alerts: List[Dict[str, Any]], *, scope: str,
                     trace_id: Optional[str] = None) -> Dict[str, Any]:
-        """POST /v1/alerts. One or many per call.
+        """POST /v1/alerts. Call with ONE alert per invocation.
 
         Each alert MUST reference its indicator(s) via:
             finding_info.related_events[].uid == indicator.metadata.uid
@@ -260,8 +285,90 @@ class UAMAlertInterfaceClient:
         A single alert may reference MANY indicators by including multiple
         related_events entries, one per uid. The server stitches them into
         the alert's Indicators tab once both sides land on the tenant.
+
+        Multi-alert bodies: the wire format accepts concatenated JSON for
+        N alerts in one POST, and the gateway returns HTTP 202, but the
+        stitcher has been observed to silently drop all but one of the
+        alerts (usea1-purple 2026-04-22). Loop callers over this method
+        one alert at a time, or use `post_alert_with_indicators`, which
+        enforces the safe pattern. A RuntimeWarning is emitted when
+        `alerts` has more than one entry so callers notice the hazard.
         """
+        if len(alerts) > 1:
+            warnings.warn(
+                "UAM Alert Interface: posting multiple alerts in a single "
+                "POST /v1/alerts call silently drops all but one alert "
+                "(HTTP 202 still returned). Loop callers one alert at a "
+                "time, or use UAMAlertInterfaceClient."
+                "post_alert_with_indicators().",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return self._post("/v1/alerts", alerts, scope=scope, trace_id=trace_id)
+
+    def post_alert_with_indicators(
+        self,
+        alert: Dict[str, Any],
+        indicators: List[Dict[str, Any]],
+        *,
+        scope: str,
+        sleep_between_s: float = 3.0,
+        trace_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Safely ingest one alert with its supporting indicators.
+
+        This wraps the canonical two-step sequence proven to get alerts
+        to surface in UAM without silent stitcher drops:
+
+          1. POST all `indicators` to /v1/indicators (batched is fine;
+             N indicators per call is the idiomatic path).
+          2. Sleep `sleep_between_s` (default 3s) so each indicator's
+             `metadata.uid` is registered before the alert's
+             `finding_info.related_events[].uid` lookups fire.
+          3. POST `alert` BY ITSELF to /v1/alerts.
+
+        Two empirical failure modes this helper prevents (confirmed on
+        `usea1-purple` 2026-04-22):
+
+          * Back-to-back POSTs with no sleep: the stitcher can resolve
+            `related_events[].uid` before the indicator lands on the
+            scope, silently dropping the alert. HTTP 202 is still
+            returned. `test_uam_alert_interface_batch.py` uses a 3s
+            sleep for this reason; reducing it below ~2s has been
+            observed to regress on loaded tenants.
+          * Multiple alerts in one POST: the wire format accepts it,
+            HTTP 202 is returned, but the stitcher silently drops all
+            but one. Callers with many alerts should loop this helper
+            once per alert.
+
+        Arguments
+        ---------
+        alert: a single alert dict (as built by `build_alert_referencing`).
+        indicators: list of indicator dicts referenced by the alert via
+            `finding_info.related_events[].uid`. May include indicators
+            not referenced by this alert -- extras are harmless.
+        scope: `S1-Scope` header value. Mandatory.
+        sleep_between_s: seconds to sleep between the indicator POST and
+            the alert POST. Defaults to 3.0; do not reduce unless you
+            are certain the target tenant is unloaded.
+        trace_id: optional `S1-Trace-Id` header value. Applied to both
+            POSTs so they can be correlated in server-side traces.
+
+        Returns
+        -------
+        `{"indicators": <indicator_resp>, "alert": <alert_resp>}`.
+        """
+        if not indicators:
+            raise ValueError(
+                "post_alert_with_indicators requires >=1 indicator; "
+                "the alert's related_events[].uid must match an indicator "
+                "metadata.uid for the stitcher to surface it.")
+        indicator_resp = self.post_indicators(
+            indicators, scope=scope, trace_id=trace_id)
+        time.sleep(sleep_between_s)
+        alert_resp = self.post_alerts(
+            [alert], scope=scope, trace_id=trace_id)
+        return {"indicators": indicator_resp, "alert": alert_resp}
 
 
 # -------------------------------------------------------------------- helpers
