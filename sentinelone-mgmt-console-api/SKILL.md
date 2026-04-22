@@ -554,16 +554,13 @@ Order: `user`, then `src.hostname`, then `src.ip.address`, then none. The collec
 
 ```
 # From the skill root, with config.json filled in.
-python build_ps_report_data.py --source "Prompt Security" --window 7d
-python render_charts.py reports/Prompt_Security_7d/data.json
-python build_docx.py     reports/Prompt_Security_7d/data.json
-python build_pptx.py     reports/Prompt_Security_7d/data.json
+python build_ps_report_data.py --source "<vendor>" --window <7d|24h|...>
+python render_charts.py reports/<slug>_<window>/data.json
+python build_docx.py     reports/<slug>_<window>/data.json
+python build_pptx.py     reports/<slug>_<window>/data.json
 ```
 
-Tested on 2026-04-22 on `usea1-purple` for two sources with very different dimension coverage:
-
-- `Prompt Security` (7d, 37k events, 41 users, action+user populated) produces the full-fat deck.
-- `Windows Event Logs` (24h, 396k events, only event.type populated) produces a shorter deck through the same pipeline, no empty tiles.
+The collector creates `reports/<slug>_<window>/` on first run. The `reports/` directory is `.gitignored`; this skill ships with the framework only, not sample outputs.
 
 ## Common high-value workflows
 
