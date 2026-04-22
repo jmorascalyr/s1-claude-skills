@@ -1,0 +1,597 @@
+"""
+UAM (Unified Alert Management) Alert Interface helper.
+
+Write-side API that pushes OCSF-formatted indicators and alerts INTO
+UAM so they surface in the console as real alerts with attached
+indicators. Separate host + wire contract from the Mgmt Console REST
+and the UAM GraphQL query layer (both of which are READ/mutate on
+pre-existing state).
+
+Prod host family (not the same as the mgmt console host):
+    https://ingest.us1.sentinelone.net
+
+Non-prod hosts (from internal docs):
+    Int (yukon):   https://igw.intus1.scalyr.com
+    Stage (yukon): https://ingest.stagingus.scalyr.com
+
+Wire contract
+-------------
+  * Content-Encoding: gzip (mandatory; zstd also accepted by the server)
+  * Authorization:    Bearer <JWT>          -- NOT "ApiToken ..."
+  * S1-Scope:         <accountId>[:<siteId>[:<groupId>]]
+  * Body:             concatenated JSON (one or more objects back-to-back,
+                      optionally newline-separated), then gzip-compressed.
+                      Used for both the single-object and the batch case.
+  * Response:         202 Accepted with {"details":"Success","status":202}
+                      on success; 4xx JSON {"details":"...", "status":<n>}
+                      on rejection.
+
+Auth token
+----------
+The interface accepts the same service-user JWT used for the Mgmt
+Console API (this client reads it from config.json via S1Client.api_token).
+`ApiToken <token>` is rejected with HTTP 401
+`{"details":"Unsupported auth type: ApiToken"}`, so callers MUST switch
+to the `Bearer` scheme when talking to this endpoint family.
+
+Indicator <-> alert linkage
+---------------------------
+Indicators live at /v1/indicators and must carry:
+    metadata.profiles = ["s1/security_indicator"]
+    metadata.uid      = "<uuid>"   # the linkage key
+Alerts live at /v1/alerts and reference indicators by UID:
+    finding_info.related_events[].uid = "<indicator metadata.uid>"
+The server stitches them once both sides land. A single alert MAY
+reference many indicators by including multiple related_events entries
+(one per indicator uid).
+
+Batching
+--------
+Both endpoints accept concatenated JSON: N indicators or N alerts in a
+single POST, back-to-back or newline-separated, gzip-compressed. The
+`_encode_batch` encoder handles it; callers just pass a list.
+
+Usage
+-----
+    from s1_client import S1Client
+    from uam_alert_interface import (
+        UAMAlertInterfaceClient,
+        build_file_indicator, build_process_indicator,
+        build_network_indicator, build_alert_referencing,
+    )
+
+    mgmt = S1Client()
+    uam  = UAMAlertInterfaceClient(bearer_token=mgmt.api_token)
+    uam.post_indicators([ind1, ind2, ind3], scope=f"{acct}:{site}")
+    uam.post_alerts([alert_linking_all_three],  scope=f"{acct}:{site}")
+"""
+from __future__ import annotations
+
+import gzip
+import json
+import os
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+
+_DEFAULT_PROD_HOST = "https://ingest.us1.sentinelone.net"
+
+# Config key (same config.json as the rest of the skill). Kept optional:
+# if not present the helper falls back to _DEFAULT_PROD_HOST.
+_CONFIG_KEY = "uam_alert_interface_url"
+_LEGACY_CONFIG_KEYS = ("ingestion_gateway_url",)   # previous name
+
+
+# ---- OCSF observable.type_id values (from OCSF Observable Type ID enum)
+# Used by the build_* helpers so callers don't have to memorise them.
+OBS_HOSTNAME       = 1
+OBS_IP_ADDRESS     = 2
+OBS_MAC_ADDRESS    = 3
+OBS_USER_NAME      = 4
+OBS_EMAIL_ADDRESS  = 5
+OBS_URL_STRING     = 6
+OBS_FILE_NAME      = 7
+OBS_HASH           = 8
+OBS_PROCESS_NAME   = 9
+OBS_RESOURCE_UID   = 10
+
+# Mapping from OCSF observable.type_id to the UI-friendly (type, typeName)
+# pair carried on related_events[].observables[]. Per the UAM "Alert and
+# Indicator Ingestion" doc, populating these lets the Indicators tab
+# render without a secondary lookup against SDL.
+_OBS_TYPE_META: Dict[int, tuple] = {
+    OBS_HOSTNAME:      ("string",  "Hostname"),
+    OBS_IP_ADDRESS:    ("ip",      "IP Address"),
+    OBS_MAC_ADDRESS:   ("string",  "MAC Address"),
+    OBS_USER_NAME:     ("string",  "User Name"),
+    OBS_EMAIL_ADDRESS: ("string",  "Email Address"),
+    OBS_URL_STRING:    ("string",  "URL String"),
+    OBS_FILE_NAME:     ("string",  "File Name"),
+    OBS_HASH:          ("string",  "Hash"),
+    OBS_PROCESS_NAME:  ("string",  "Process Name"),
+    OBS_RESOURCE_UID:  ("integer", "Resource UID"),
+}
+
+
+def _enrich_observable_for_alert(obs: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy an observable onto an alert's related_events[] entry,
+    adding the `type` + `typeName` fields the UAM UI reads for rendering.
+    """
+    type_id = obs.get("type_id")
+    t, tn = _OBS_TYPE_META.get(type_id, ("string", "Other"))
+    out = {
+        "name": obs.get("name"),
+        "type_id": type_id,
+        "type": t,
+        "typeName": tn,
+        "value": obs.get("value"),
+    }
+    return out
+
+
+def _load_config_url() -> Optional[str]:
+    cfg_path = Path(__file__).resolve().parent.parent / "config.json"
+    if not cfg_path.is_file():
+        return None
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except Exception:
+        return None
+    for key in (_CONFIG_KEY, *_LEGACY_CONFIG_KEYS):
+        url = cfg.get(key)
+        if isinstance(url, str) and url.strip():
+            return url.rstrip("/")
+    return None
+
+
+class UAMAlertInterfaceError(RuntimeError):
+    def __init__(self, status: int, body: str, *, method: str, url: str):
+        self.status = status
+        self.body = body
+        self.method = method
+        self.url = url
+        super().__init__(f"HTTP {status} on {method} {url}: {body}")
+
+
+class UAMAlertInterfaceClient:
+    """Thin wrapper over POST /v1/indicators and POST /v1/alerts against
+    the UAM Alert Interface (Unified Alert Management ingestion surface).
+
+    Intentionally stdlib-only (urllib + gzip) so it has no coupling to
+    the `requests`-based S1Client and can run in a fresh Python without
+    extra deps.
+    """
+
+    def __init__(
+        self,
+        *,
+        bearer_token: str,
+        base_url: Optional[str] = None,
+        timeout: float = 30.0,
+    ):
+        if not bearer_token or bearer_token.startswith("REPLACE"):
+            raise RuntimeError(
+                "UAMAlertInterfaceClient requires a non-empty bearer_token "
+                "(typically the same JWT as S1Client.api_token)."
+            )
+        self.bearer_token = bearer_token
+        self.base_url = (
+            (base_url
+             or os.environ.get("S1_UAM_ALERT_INTERFACE_URL")
+             or os.environ.get("S1_IGW_URL")    # legacy env name
+             or _load_config_url()
+             or _DEFAULT_PROD_HOST)
+            .rstrip("/")
+        )
+        self.timeout = timeout
+
+    # ------------------------------------------------------------------ core
+    @staticmethod
+    def _encode_batch(objs: Iterable[Dict[str, Any]]) -> bytes:
+        """Concatenated JSON (newline-separated) + gzip compression.
+
+        Both the single-object case and the batch case go through this
+        path, so the wire format is always identical.
+        """
+        items = list(objs)
+        if not items:
+            raise ValueError("batch is empty")
+        raw = ("\n".join(json.dumps(o, separators=(",", ":")) for o in items)
+               ).encode("utf-8")
+        return gzip.compress(raw)
+
+    def _post(self, path: str, objs: Iterable[Dict[str, Any]], *, scope: str,
+              trace_id: Optional[str] = None) -> Dict[str, Any]:
+        if not scope:
+            raise ValueError(
+                "S1-Scope is mandatory. Pass scope='<accountId>' or "
+                "'<accountId>:<siteId>'."
+            )
+        url = f"{self.base_url}{path}"
+        body_gz = self._encode_batch(objs)
+        headers = {
+            "Authorization": f"Bearer {self.bearer_token}",
+            "Content-Encoding": "gzip",
+            "Content-Type": "application/json",
+            "S1-Scope": scope,
+        }
+        if trace_id:
+            headers["S1-Trace-Id"] = trace_id
+        req = urllib.request.Request(url, data=body_gz, method="POST",
+                                     headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read()
+                try:
+                    return json.loads(raw.decode("utf-8"))
+                except Exception:
+                    return {"status": resp.status, "raw": raw[:500].decode(
+                        "utf-8", errors="replace")}
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = "<unreadable body>"
+            raise UAMAlertInterfaceError(e.code, body, method="POST", url=url)
+
+    # ------------------------------------------------------------------ API
+    def post_indicators(self, indicators: List[Dict[str, Any]], *, scope: str,
+                        trace_id: Optional[str] = None) -> Dict[str, Any]:
+        """POST /v1/indicators. One or many per call.
+
+        Each indicator MUST carry:
+            metadata.profiles >= ["s1/security_indicator"]
+            metadata.uid       = <uuid>          # linkage key
+            class_uid / type_uid / activity_id   # OCSF required
+            observables[]                        # surfaces in UAM Indicators tab
+        """
+        return self._post("/v1/indicators", indicators, scope=scope,
+                          trace_id=trace_id)
+
+    def post_alerts(self, alerts: List[Dict[str, Any]], *, scope: str,
+                    trace_id: Optional[str] = None) -> Dict[str, Any]:
+        """POST /v1/alerts. One or many per call.
+
+        Each alert MUST reference its indicator(s) via:
+            finding_info.related_events[].uid == indicator.metadata.uid
+
+        A single alert may reference MANY indicators by including multiple
+        related_events entries, one per uid. The server stitches them into
+        the alert's Indicators tab once both sides land on the tenant.
+        """
+        return self._post("/v1/alerts", alerts, scope=scope, trace_id=trace_id)
+
+
+# -------------------------------------------------------------------- helpers
+
+def _observable(name: str, type_id: int, value: str) -> Dict[str, Any]:
+    """Build one OCSF observable dict. Kept as a helper so callers don't
+    hand-mix field orders."""
+    return {"name": name, "type_id": type_id, "value": value}
+
+
+def _base_indicator(
+    *,
+    indicator_uid: str,
+    now_ms: int,
+    class_uid: int,
+    activity_id: int,
+    category_uid: int,
+    device_uid: str,
+    device_hostname: str,
+    user_uid: str,
+    user_name: str,
+    message: str,
+    observables: List[Dict[str, Any]],
+    severity_id: int = 2,
+    extra_top_level: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Common skeleton for every OCSF indicator this module builds. The
+    class/activity-specific fields (file / process / network) come in
+    via `extra_top_level`."""
+    body: Dict[str, Any] = {
+        "message": message,
+        "time": now_ms,
+        "device": {
+            "uid": device_uid,
+            "name": device_hostname,
+            "type_id": 1,
+            "hostname": device_hostname,
+        },
+        "metadata": {
+            "version": "1.6.0-dev",
+            "product": {"name": "smoke-product"},
+            "extensions": [{"name": "s1", "uid": "998", "version": "0.1.0"}],
+            "profiles": ["s1/security_indicator"],
+            "uid": indicator_uid,
+        },
+        "type_uid": class_uid * 100 + activity_id,
+        "activity_id": activity_id,
+        "class_uid": class_uid,
+        "category_uid": category_uid,
+        "observables": observables,
+        "actor": {
+            "user": {
+                "name": user_name,
+                "type": "System",
+                "uid": user_uid,
+                "type_id": 3,
+            }
+        },
+        "severity_id": severity_id,
+        "attack_surface_id": 1,
+    }
+    if extra_top_level:
+        body.update(extra_top_level)
+    return body
+
+
+def build_file_indicator(
+    *,
+    indicator_uid: str,
+    file_name: str,
+    device_uid: str,
+    device_hostname: str,
+    user_uid: str,
+    user_name: str = "smoke-user",
+    now_ms: int,
+    message: Optional[str] = None,
+    severity_id: int = 2,
+    # Optional enrichments -- any observable the caller adds is both
+    # attached to the observables[] array AND the corresponding top-level
+    # OCSF field, so the record is schema-valid.
+    file_path: Optional[str] = None,
+    file_sha256: Optional[str] = None,
+    file_md5: Optional[str] = None,
+    device_ip: Optional[str] = None,
+    activity_id: int = 1,   # 1=Create, 2=Read, 3=Update, 4=Delete, ...
+) -> Dict[str, Any]:
+    """OCSF FileSystem Activity indicator (class_uid=1001).
+
+    Observables populated:
+        * file.name                     (always)
+        * file.path                     (if file_path)
+        * file.hashes.sha256            (if file_sha256)
+        * file.hashes.md5               (if file_md5)
+        * device.ip                     (if device_ip)
+        * device.hostname               (always)
+    """
+    observables = [
+        _observable("file.name", OBS_FILE_NAME, file_name),
+        _observable("device.hostname", OBS_HOSTNAME, device_hostname),
+    ]
+    file_obj: Dict[str, Any] = {"name": file_name, "type_id": 1}
+    if file_path:
+        file_obj["path"] = file_path
+        observables.append(_observable("file.path", OBS_FILE_NAME, file_path))
+    hashes: Dict[str, str] = {}
+    if file_sha256:
+        hashes["sha256"] = file_sha256
+        observables.append(_observable(
+            "file.hashes.sha256", OBS_HASH, file_sha256))
+    if file_md5:
+        hashes["md5"] = file_md5
+        observables.append(_observable(
+            "file.hashes.md5", OBS_HASH, file_md5))
+    if hashes:
+        file_obj["hashes"] = hashes
+    extra: Dict[str, Any] = {"file": file_obj}
+    if device_ip:
+        observables.append(_observable("device.ip", OBS_IP_ADDRESS, device_ip))
+    return _base_indicator(
+        indicator_uid=indicator_uid,
+        now_ms=now_ms,
+        class_uid=1001,
+        activity_id=activity_id,
+        category_uid=1,
+        device_uid=device_uid,
+        device_hostname=device_hostname,
+        user_uid=user_uid,
+        user_name=user_name,
+        message=message or f"File {file_name} {('action_' + str(activity_id))}",
+        observables=observables,
+        severity_id=severity_id,
+        extra_top_level=extra,
+    )
+
+
+def build_process_indicator(
+    *,
+    indicator_uid: str,
+    process_name: str,
+    process_pid: int,
+    process_cmd_line: Optional[str],
+    device_uid: str,
+    device_hostname: str,
+    user_uid: str,
+    user_name: str = "smoke-user",
+    now_ms: int,
+    message: Optional[str] = None,
+    severity_id: int = 2,
+    parent_process_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """OCSF Process Activity indicator (class_uid=1007, activity=Launch).
+
+    Observables populated:
+        * process.name                  (always)
+        * process.pid                   (always)
+        * process.cmd_line              (if cmd_line)
+        * process.parent_process.name   (if parent_process_name)
+        * device.hostname               (always)
+    """
+    observables = [
+        _observable("process.name", OBS_PROCESS_NAME, process_name),
+        _observable("process.pid", OBS_RESOURCE_UID, str(process_pid)),
+        _observable("device.hostname", OBS_HOSTNAME, device_hostname),
+    ]
+    process: Dict[str, Any] = {
+        "name": process_name,
+        "pid": process_pid,
+    }
+    if process_cmd_line:
+        process["cmd_line"] = process_cmd_line
+        observables.append(_observable(
+            "process.cmd_line", OBS_PROCESS_NAME, process_cmd_line))
+    if parent_process_name:
+        process["parent_process"] = {"name": parent_process_name, "pid": 1}
+        observables.append(_observable(
+            "process.parent_process.name", OBS_PROCESS_NAME,
+            parent_process_name))
+    return _base_indicator(
+        indicator_uid=indicator_uid,
+        now_ms=now_ms,
+        class_uid=1007,
+        activity_id=1,   # Launch
+        category_uid=1,
+        device_uid=device_uid,
+        device_hostname=device_hostname,
+        user_uid=user_uid,
+        user_name=user_name,
+        message=message or f"Process {process_name} launched (pid={process_pid})",
+        observables=observables,
+        severity_id=severity_id,
+        extra_top_level={"process": process},
+    )
+
+
+def build_network_indicator(
+    *,
+    indicator_uid: str,
+    src_ip: str,
+    dst_ip: str,
+    dst_port: int,
+    url: Optional[str],
+    device_uid: str,
+    device_hostname: str,
+    user_uid: str,
+    user_name: str = "smoke-user",
+    now_ms: int,
+    message: Optional[str] = None,
+    severity_id: int = 2,
+) -> Dict[str, Any]:
+    """OCSF Network Activity indicator (class_uid=4001, activity=Open).
+
+    Observables populated:
+        * src_endpoint.ip       (always)
+        * dst_endpoint.ip       (always)
+        * dst_endpoint.port     (always)
+        * url.full              (if url)
+        * device.hostname       (always)
+    """
+    observables = [
+        _observable("src_endpoint.ip", OBS_IP_ADDRESS, src_ip),
+        _observable("dst_endpoint.ip", OBS_IP_ADDRESS, dst_ip),
+        _observable("dst_endpoint.port", OBS_RESOURCE_UID, str(dst_port)),
+        _observable("device.hostname", OBS_HOSTNAME, device_hostname),
+    ]
+    extra: Dict[str, Any] = {
+        "src_endpoint": {"ip": src_ip},
+        "dst_endpoint": {"ip": dst_ip, "port": dst_port},
+    }
+    if url:
+        extra["url"] = {"url_string": url}
+        observables.append(_observable("url.full", OBS_URL_STRING, url))
+    return _base_indicator(
+        indicator_uid=indicator_uid,
+        now_ms=now_ms,
+        class_uid=4001,
+        activity_id=1,    # Open
+        category_uid=4,   # Network Activity
+        device_uid=device_uid,
+        device_hostname=device_hostname,
+        user_uid=user_uid,
+        user_name=user_name,
+        message=message or f"Network {src_ip} -> {dst_ip}:{dst_port}",
+        observables=observables,
+        severity_id=severity_id,
+        extra_top_level=extra,
+    )
+
+
+def build_alert_referencing(
+    *,
+    alert_uid: str,
+    indicators: List[Dict[str, Any]],
+    now_ms: int,
+    title: str,
+    description: str,
+    severity_id: int = 2,
+) -> Dict[str, Any]:
+    """S1 SecurityAlert that references one OR many indicators.
+
+    `indicators` is a list of indicator dicts (as returned by any
+    build_*_indicator helper above). The returned alert embeds one
+    `finding_info.related_events[]` entry per indicator, linked by
+    metadata.uid. Observables are carried through on each related_events
+    entry so the UAM Indicators tab surfaces the right data.
+    """
+    if not indicators:
+        raise ValueError("alert must reference at least one indicator")
+
+    # Per SentinelOne UAM "Alert and Indicator Ingestion" docs: carry the
+    # class/type/category/activity fields and enriched observables forward
+    # onto each related_events entry so the UI can render the Indicators
+    # tab without a secondary lookup against SDL. Observables get extra
+    # `type` + `typeName` fields for rendering.
+    related_events = []
+    for ind in indicators:
+        enriched_obs = [_enrich_observable_for_alert(o)
+                        for o in ind.get("observables", [])]
+        related_events.append({
+            "message": ind.get("message", ""),
+            "time": ind["time"],
+            "uid": ind["metadata"]["uid"],
+            "severity_id": ind.get("severity_id", severity_id),
+            "observables": enriched_obs,
+            "class_uid": ind.get("class_uid"),
+            "type_uid": ind.get("type_uid"),
+            "category_uid": ind.get("category_uid"),
+            "activity_id": ind.get("activity_id"),
+        })
+
+    # resources[] on an S1 Security Alert is the affected ASSET. Per the
+    # UAM "Alert and Indicator Ingestion" worked example, a single alert
+    # targets a single asset even when referencing multiple indicators.
+    # We take the first indicator's device as the authoritative resource;
+    # callers who truly need per-indicator assets should emit separate
+    # alerts. (The stitcher silently drops alerts whose related_events
+    # span multiple devices but declare multiple resources, so keeping
+    # this to one resource is the robust pattern.)
+    first_dev = indicators[0].get("device", {}) or {}
+    resources = [{
+        "uid": first_dev.get("uid", "unknown"),
+        "name": first_dev.get("hostname", "unknown"),
+        "type_id": 1,
+        "type": "host",
+    }]
+
+    return {
+        "finding_info": {
+            "uid": alert_uid,
+            "title": title,
+            "desc": description,
+            "related_events": related_events,
+        },
+        "resources": resources,
+        "category_uid": 2,
+        "category_name": "Findings",
+        "class_uid": 99602001,
+        "class_name": "S1 Security Alert",
+        "type_uid": 9960200101,
+        "type_name": "S1 Security Alert: Create",
+        "activity_id": 1,
+        "metadata": {
+            "version": "1.6.0-dev",
+            "extension": {"name": "s1", "uid": "998", "version": "0.1.0"},
+            "product": {"name": "smoke-product", "vendor_name": "smoke-vendor"},
+            "logged_time": now_ms,
+            "modified_time": now_ms,
+        },
+        "time": now_ms,
+        "attack_surface_ids": [1],
+        "severity_id": severity_id,
+        "state_id": 1,
+        "s1_classification_id": 1,
+    }

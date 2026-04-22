@@ -39,7 +39,25 @@ cd ~/.claude/skills/sentinelone-mgmt-console-api
 python scripts/s1_client.py
 ```
 
-Should print the first 5 accounts.
+Should print the first 5 accounts, then fan out 4 parallel GETs.
+
+## Probe a new tenant (non-destructive)
+
+```bash
+python scripts/smoke_test_queries.py --workers 12
+```
+
+Enumerates every GET plus a curated allow-list of read-only query POSTs, writes `references/tenant_capabilities.{json,md}`. Read-only — no writes, no agent actions. After the sweep you can filter searches to only confirmed-working endpoints:
+
+```bash
+python scripts/search_endpoints.py "threats" --only-works
+```
+
+## Orientation
+
+- `references/CAPABILITY_MAP.md` — per-tag verb+resource summary ("I want to…" lookup).
+- `references/WORKFLOWS.md` — ready-to-adapt multi-step recipes.
+- `references/TAG_INDEX.md` — full 113-tag directory with per-tag reference files.
 
 Unified Alert Management:
 
@@ -60,9 +78,10 @@ Purple AI answers questions about SDL telemetry (process/network/file events, in
 
 - `SKILL.md` — instructions Claude reads when the skill triggers
 - `config.json` — credentials (gitignore this; `config.json.example` is the template)
-- `scripts/s1_client.py` — REST client (auth, retries, cursor pagination)
+- `scripts/s1_client.py` — REST client (auth, pooled HTTP, retries, cursor pagination, parallel `get_many()`, optional cache)
 - `scripts/call_endpoint.py` — REST CLI wrapper
-- `scripts/search_endpoints.py` — keyword search over the endpoint index
+- `scripts/search_endpoints.py` — ranked keyword search over the endpoint index (verb-aware, `--only-works` filter)
+- `scripts/smoke_test_queries.py` — non-destructive sweep of every GET + safe query POST
 - `scripts/purple_ai.py` — Purple AI GraphQL wrapper (`purple_query()`, `PurpleAIError`)
 - `scripts/call_purple.py` — Purple AI CLI wrapper
 - `scripts/unified_alerts.py` — Unified Alert Management GraphQL wrapper (queries, mutations, triage helpers)
