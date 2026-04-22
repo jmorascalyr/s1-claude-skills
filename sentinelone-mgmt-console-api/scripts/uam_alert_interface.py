@@ -366,17 +366,27 @@ def build_file_indicator(
     if file_path:
         file_obj["path"] = file_path
         observables.append(_observable("file.path", OBS_FILE_NAME, file_path))
-    hashes: Dict[str, str] = {}
+    # OCSF 1.6.0 file.hashes is Array of Fingerprint objects, NOT a dict.
+    # Empirically (diag2 on usea1-purple 2026-04-22): posting hashes as a
+    # dict ({"sha256": "..."}) causes the UAM indicator stitcher to silently
+    # drop the indicator (POST still returns 202). The correct Fingerprint
+    # shape is {"algorithm_id": <int>, "algorithm": "<name>", "value": "<hex>"}.
+    # OCSF algorithm_id enum: 1=unknown, 2=MD5, 3=SHA-1 (v1.5) / SHA-256 in
+    # newer profiles; we follow S1's 'security_indicator' profile where
+    # sha256 uses id=3 and md5 uses id=2.
+    hashes_arr: List[Dict[str, Any]] = []
     if file_sha256:
-        hashes["sha256"] = file_sha256
+        hashes_arr.append({"algorithm_id": 3, "algorithm": "SHA-256",
+                           "value": file_sha256})
         observables.append(_observable(
             "file.hashes.sha256", OBS_HASH, file_sha256))
     if file_md5:
-        hashes["md5"] = file_md5
+        hashes_arr.append({"algorithm_id": 2, "algorithm": "MD5",
+                           "value": file_md5})
         observables.append(_observable(
             "file.hashes.md5", OBS_HASH, file_md5))
-    if hashes:
-        file_obj["hashes"] = hashes
+    if hashes_arr:
+        file_obj["hashes"] = hashes_arr
     extra: Dict[str, Any] = {"file": file_obj}
     if device_ip:
         observables.append(_observable("device.ip", OBS_IP_ADDRESS, device_ip))

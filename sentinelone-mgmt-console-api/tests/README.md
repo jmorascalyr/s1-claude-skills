@@ -346,7 +346,7 @@ touches real infrastructure. Hashes are deterministic per `run_tag`.
 Same wire contract, same "semi-reversible" cleanup as test #9; the only
 delta is the payload shape.
 
-**Known limitations (empirically confirmed on `usea1-purple`
+**Payload constraints (empirically confirmed on `usea1-purple`
 2026-04-22):**
 
 1. **Alerts that span multiple devices are silently dropped by the
@@ -360,19 +360,30 @@ delta is the payload shape.
    alerts. The batch test uses a single shared device for all 3
    indicators, matching the doc's worked example ("multi-stage activity
    observed on DC01").
-2. **Multi-indicator stitching is partial even with a single device.**
-   With the corrected payload (enriched `related_events[]` carrying
-   `class_uid`/`type_uid`/`category_uid`/`activity_id` plus each
-   observable's `type` + `typeName` fields), 2 of 3 indicators
-   reliably surface in `alert.rawIndicators` within a 2-minute grace
-   window, but the third stitches intermittently. The test therefore
-   exits non-zero on link assertion failure; the alert itself surfaces
-   correctly and cleanup still runs. Treat this test as a "progress
-   signal" rather than a hard pass.
+2. **`file.hashes` must be OCSF Fingerprint array, not dict.** OCSF
+   1.6.0 defines `file.hashes` as an array of Fingerprint objects
+   (`[{"algorithm_id": 3, "algorithm": "SHA-256", "value": "<hex>"}, ...]`).
+   Posting `{"sha256": "<hex>"}` (dict form) returns 202 at the wire
+   but the stitcher silently drops the file indicator. Bug discovered
+   and fixed in `build_file_indicator()` on 2026-04-22 via diagnostic
+   pass 2 (trial B `sha256-dict-layout` FAILS vs trial C
+   `sha256-array-layout` OK). With the array shape, all 3 indicators
+   (file + process + network) stitch reliably within 2-5s.
 3. **Related_events payload requirements** (beyond `uid`): the UAM
    "Alert and Indicator Ingestion" doc calls these "recommended for UI
    rendering"; in practice they look load-bearing for the stitcher on
    multi-indicator alerts. Our builder populates them by default.
+4. **GraphQL `alertWithRawIndicators` rendering quirk in batch mode.**
+   When multiple rawIndicators are stitched to one alert, the server
+   returns the flat-key representation (`observables[N].name`/`.value`/
+   `.type_id`) with shuffled VALUES on all entries except the last.
+   Keys are stable; values from other fields (e.g. `account.name`,
+   `metadata.product.name`) bleed into `observables[N].*` slots. Does
+   NOT affect stitching -- `metadata.uid` is correct and the UI reads
+   from a different code path. Programmatic consumers should assert on
+   `metadata.uid` presence in `alert.rawIndicators`, not on flattened
+   `observables[N].name` fields, in batch mode. The batch test treats
+   per-observable assertions as informational for this reason.
 
 ---
 
