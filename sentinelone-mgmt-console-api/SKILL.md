@@ -66,6 +66,7 @@ It enumerates every GET plus a curated allow-list of read-only query POSTs, reco
 - `references/endpoint_index.json` — compact machine-readable index (one entry per op). Used by `search_endpoints.py` but can be read directly if you need to filter programmatically.
 - `references/tags/<Tag>.md` — per-tag reference with parameters, descriptions, and required permissions. Load only the files you need.
 - `references/common_params.md` — shared query params (`skip`, `limit`, `cursor`, `sortBy`, etc.) and the pagination pattern.
+- `references/POWERQUERY_RECIPES.md` — PowerQuery / SDL query recipes tested on-tenant: indicator prevalence, PowerShell outbound to public IPs, failed-login triage, storyline activity summary, UAM-indicator SDL crosscheck, endpoint heartbeat. For full PQ language reference use the dedicated `sentinelone-powerquery` skill.
 - `spec/swagger_2_1.json` — the original full Swagger spec (14 MB). Use only when the per-tag reference is insufficient — e.g. to resolve a deeply nested request-body schema by `$ref`. Never read this whole file into context.
 - `tests/test_ioc_lifecycle.py` — reversible CREATE → LIST → DELETE → VERIFY round-trip for Threat Intelligence IOCs. Uses a unique run-tag per invocation, scopes to a single account, and cleans up before exit. Covers the one "create content" path against the S1 detection surface.
 - `tests/test_alerts_dual_api.py` — dual-API round-trip for alerts: GraphQL list/detail/addNote/notes/deleteNote plus a parallel REST `/cloud-detection/alerts` read. Demonstrates that UAM GraphQL is the PRIMARY alert surface and REST is SECONDARY, with the note mutation cleaned up before exit (handles the `mgmt_note_id` propagation delay).
@@ -180,6 +181,48 @@ Key fields in the normalized dict:
 - The GraphQL endpoint is **undocumented** and not a committed public API. Field names, schema, and behavior can change between console releases. Flag this when building anything production-grade on top.
 - Entitlement and permission failures come back as HTTP 200 with `status.error` populated. The wrapper raises `PurpleAIError` on these so they don't masquerade as empty results — surface the `error_type` to the user verbatim (it's the best hint we have for "re-issue the token with Purple AI permission" vs "the tenant isn't licensed for Purple").
 - `teamToken` and `accountId` in the request body are UI-session artifacts; empty strings are accepted for API-token auth.
+
+## Long Running Query (LRQ) - canonical PowerQuery / log-search path
+
+For any programmatic PowerQuery or log search against this tenant, use the **Long Running Query API** at `POST /sdl/v2/api/queries` on the tenant's own console host. It supersedes `/api/powerQuery` (SDL v1) and the Deep Visibility `/dv/events/pq` endpoint (mgmt REST). Both older paths are deprecated and sunset on 2027-02-15. LRQ is async, parallelizes cleanly, has higher limits, and is the only path that stays supported after sunset. Full reference and canonical Python runner live in the `sentinelone-powerquery` skill at `references/lrq-api.md`.
+
+**Crucially, the S1Client's JWT doubles as the LRQ Bearer token** - only the auth prefix changes:
+
+```python
+from s1_client import S1Client
+c = S1Client()
+# REST / GraphQL:  Authorization: ApiToken <jwt>   (c.api_token)
+# LRQ:             Authorization: Bearer   <jwt>   (same value, Bearer prefix)
+```
+
+Use this in two situations:
+
+1. **Fallback when the Purple MCP `powerquery` tool times out.** The MCP has tight per-call timeouts and no parallelism. When it returns a timeout or 5xx for anything past 24h or with wide filters, re-run the same query through LRQ with the existing `S1Client.api_token`. Don't shrink the time range to fit the MCP budget - LRQ will handle what the MCP can't.
+2. **Any multi-slice, long-window, or programmatic PowerQuery.** Default to LRQ rather than `/dv/events/pq` or `/api/powerQuery`, especially for ranges > 24h.
+
+Minimal fallback pattern (inline, no extra client class required):
+
+```python
+import time, requests
+from s1_client import S1Client
+
+c = S1Client()
+jwt = c.api_token
+base = c.base_url  # e.g. https://usea1-purple.sentinelone.net
+headers = {"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}
+body = {
+    "queryType": "PQ", "tenant": True,
+    "startTime": "2026-04-21T00:00:00Z", "endTime": "2026-04-22T00:00:00Z",
+    "queryPriority": "HIGH",
+    "pq": {"query": "<your PQ>", "resultType": "TABLE"},
+}
+r = requests.post(f"{base}/sdl/v2/api/queries", headers=headers, json=body, timeout=30)
+qid = r.json()["id"]
+forward_tag = r.headers["X-Dataset-Query-Forward-Tag"]
+# poll every 1-2s, cancel on completion - see the powerquery skill's lrq-api.md
+```
+
+For anything beyond a single slice (ranges > 2-3 days, heavy aggregates, 100M+ event scans), use the full runner at `/sessions/great-serene-euler/pq_30d_max_lrq_v2.py` (two-JWT round-robin, ~29s on a 30d 574M-event aggregate) rather than hand-rolling poll/cancel. The measured perf and slicing recipes are in `references/tenant_capabilities.md` (bottom) and in the sentinelone-powerquery skill's `references/lrq-api.md`.
 
 ## Unified Alert Management (UAM) — PRIMARY alert API
 
@@ -336,18 +379,33 @@ uam_iface.post_alerts    ([alert],        scope=f"{account_id}:{site_id}")
   `typeName` alongside `type_id`/`name`/`value`). `build_alert_referencing()`
   populates all of these. Omitting any of them tends to cause the
   stitcher to silently drop the alert.
-- Even with the correct payload, multi-indicator stitching on-tenant
-  is **partial and asynchronous**: the alert surfaces in UAM within
-  ~30s, but individual indicators appear in `alert.rawIndicators` over
-  a window of 30-120s, and not all of them are guaranteed to land
-  every time. In practice 2 of 3 indicators land reliably; the third
-  is flaky. Treat ingestion as a fire-and-forget pattern and don't
-  assert strict N-of-N linkage.
+- **`file.hashes` MUST be an OCSF Fingerprint array, not a dict.**
+  OCSF 1.6.0 defines `file.hashes` as `Array of Fingerprint objects`:
+  `[{"algorithm_id": 3, "algorithm": "SHA-256", "value": "<hex>"}, ...]`.
+  Posting `{"sha256": "<hex>"}` (dict form) causes the stitcher to
+  silently drop the file indicator even though POST returns 202.
+  `build_file_indicator()` emits the correct array shape; custom
+  payload builders must follow the same convention (algorithm_id 2=MD5,
+  3=SHA-256, 4=SHA-1, 5=SHA-512).
+- Multi-indicator stitching is asynchronous. Alerts surface within
+  ~30s; individual indicators appear in `alert.rawIndicators` over a
+  window of 2-120s. Tests must poll with a grace window, not assert
+  immediately.
+- **Server-side rendering quirk in `alertWithRawIndicators` GraphQL:**
+  when an alert has multiple stitched rawIndicators, the flat-key
+  representation (`observables[N].name`/`.value`/`.type_id`) has
+  shuffled VALUES on all but the last entry in the array -- keys are
+  stable, values get mixed with other fields (e.g. `observables[2].name`
+  may return `"smoke-product"` because it was populated from
+  `metadata.product.name`). Does NOT affect stitching -- `metadata.uid`
+  is correct and the UI reads from a different code path. Programmatic
+  consumers should assert on `metadata.uid` presence, not on flattened
+  `observables[N].name` fields, in batch mode.
 
 **Tested on `usea1-purple` 2026-04-22:**
 
 - `tests/test_uam_alert_interface_single.py` -- CONFIRMED WORKING end-to-end. 1 indicator + 1 alert, indicator stitches inside 30s, cleanup verified.
-- `tests/test_uam_alert_interface_batch.py` -- PARTIAL. 3 indicators batched into one POST (wire ok); alert with 3 related_events surfaces correctly when all indicators share a device; stitching surfaces 2 of 3 indicators in `alert.rawIndicators` within 2 min.
+- `tests/test_uam_alert_interface_batch.py` -- CONFIRMED WORKING end-to-end. 3 indicators batched into one POST, alert with 3 related_events surfaces in UAM, all 3 indicators stitch into `alert.rawIndicators` within 2-5s, cleanup verified. Per-observable name assertion treated as informational due to GraphQL server-side rendering quirk noted above.
 
 See `tests/test_uam_alert_interface_single.py` for the minimum-viable worked example, and `tests/test_uam_alert_interface_batch.py` for a batched 3-indicator / multi-observable / multi-class round-trip.
 

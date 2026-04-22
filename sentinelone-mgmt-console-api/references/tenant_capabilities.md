@@ -510,3 +510,79 @@
 | `/web/api/v2.1/singularity-marketplace/applications-catalog/{applicationCatalogId}/config` | marketplace | applicationCatalogId |
 | `/web/api/v2.1/singularity-marketplace/applications/{applicationId}/config` | marketplace | applicationId |
 | `/web/api/v2.1/singularity-marketplace/applications/{id}/log` | marketplace | id |
+
+## PowerQuery 30-day performance (LRQ API)
+
+Benchmark of the Long Running Query API (`POST /sdl/v2/api/queries`) on the same tenant (`usea1-purple.sentinelone.net`), run on 2026-04-22. Target workload: aggregate every EDR event over 30 days, grouped by `event.type`, returning the top 50.
+
+**Query:**
+
+```
+dataSource.name='SentinelOne' dataSource.category='security' event.type=*
+| group ct=count(), first_seen=min(timestamp), last_seen=max(timestamp) by event.type
+| sort -ct
+| limit 50
+```
+
+**Scope of the aggregate:** ~574.6M events matched across 50 distinct `event.type` values.
+
+### v1: single user JWT, token-bucket at 2.5 rps
+
+Single service-user identity (one JWT). Per-user 3 rps cap is the hard ceiling; token-bucket at 2.5 rps leaves headroom for retries.
+
+| Shape      | Pool | Wall clock | vs serial |
+|------------|------|------------|-----------|
+| 30d serial | 1    | 166.35s    | 1.00x     |
+| 30 x 1d    | 3    | 86.96s     | 1.91x     |
+| 6 x 5d     | 3    | 66.25s     | 2.51x (best 1-token) |
+
+Per-slice latencies in the 6x5d best: p50 33.41s, p95 34.60s, max 34.60s. Each slice is big, so the floor is the slowest single slice. Shrinking slices trades backend cost for API-call cost and is worse on a single token.
+
+### v2: two distinct service-user JWTs, round-robin
+
+Two service-user tokens with different `sub` claims, each bound to its own `LRQClient` instance for the full launch-poll-cancel lifecycle (the `X-Dataset-Query-Forward-Tag` is session-scoped). Combined budget: ~5 rps.
+
+| Shape   | Pool | Wall clock | vs 1-tok best | vs serial |
+|---------|------|------------|---------------|-----------|
+| 30 x 1d | 6    | 34.77s     | 1.91x         | 4.78x     |
+| 15 x 2d | 6    | 28.56s     | 2.32x         | 5.83x (best 2-token) |
+| 10 x 3d | 6    | 28.52s     | 2.32x         | 5.83x     |
+
+Per-slice latencies in the 15x2d best: p50 9.24s, p95 12.72s, max 12.72s. The ~28.5s wall-clock floor is the tail of the slowest slice plus merge, not a rate-limit artefact. Load distributes cleanly across the two clients (8/7 in the 15x2d run, 5/5 in the 10x3d run).
+
+### Bottleneck model
+
+1. Per-user 3 rps rate cap is the first ceiling.
+2. Once beaten (by using 2+ service-user tokens), the new ceiling is the slowest slice's server-side runtime (p95 ~9-17s at 2-3d slices on this tenant).
+3. More pool width past the runtime ceiling does not help. To push below 20s on the same query: add a third JWT (expected 18-22s), swap `| group` for `| top K` (probabilistic but orders of magnitude faster on huge ranges), or narrow the initial filter (`event.type in ('Process Creation','File Creation','Module Load')`).
+
+### Top 10 event types (30 days)
+
+From the v2 15x2d run (matchCount 574,382,851):
+
+| Rank | event.type                  | count       | share |
+|-----:|-----------------------------|------------:|------:|
+| 1    | Process Creation            | 153,845,481 | 26.8% |
+| 2    | File Creation               |  92,737,835 | 16.1% |
+| 3    | File Deletion               |  83,193,805 | 14.5% |
+| 4    | File Rename                 |  34,323,544 |  6.0% |
+| 5    | Module Load                 |  26,700,420 |  4.6% |
+| 6    | IP Connect                  |  24,757,869 |  4.3% |
+| 7    | Registry Value Modified     |  23,218,105 |  4.0% |
+| 8    | Command Script              |  22,030,082 |  3.8% |
+| 9    | File Modification           |  18,661,647 |  3.2% |
+| 10   | Named Pipe Connection       |  13,952,148 |  2.4% |
+
+### Runners
+
+- `/sessions/great-serene-euler/pq_30d_max_lrq.py` - single-token runner with token-bucket rate limiting and three slice-shape modes. Best 30d wall: 66.25s (6x5d pool=3).
+- `/sessions/great-serene-euler/pq_30d_max_lrq_v2.py` - two-JWT round-robin runner, pool=6, ~5 rps combined. Best 30d wall: 28.52s (10x3d) / 28.56s (15x2d).
+
+Both pull their JWTs from `config.json`'s `api_token` (default) and `single_scope_api_token` entries, swap `ApiToken` for `Bearer`, and point at the tenant's own console host (not `xdr.us1.sentinelone.net`).
+
+### Takeaways for the skill
+
+- LRQ API is the canonical programmatic path for every PowerQuery against this tenant: `/api/powerQuery` and `/dv/events/pq` sunset on 2027-02-15.
+- For 30-day workloads, 15x2d pool=6 with two JWTs is the reliable sweet spot at ~29s wall clock.
+- A single-token runner can reach 66s on 30 days; anything further requires adding tokens, swapping to `| top K`, or narrowing the filter.
+- Use the Purple MCP `powerquery` tool for interactive 24h hunts; fall back to the LRQ runner (same JWT, Bearer prefix) whenever the MCP times out or the window exceeds a few days.

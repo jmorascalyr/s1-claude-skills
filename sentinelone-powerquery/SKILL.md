@@ -16,7 +16,7 @@ When the user asks you to write or investigate with a PowerQuery:
 1. **Clarify the intent** if it's ambiguous (time range, data view, what the output should look like). A good PQ is scoped — not everything needs to be hunted over 30 days.
 2. **Draft the query** following the grammar below. Favor `filter | group | sort | limit | columns` as the default shape — it's what most real investigations need.
 3. **Run it against the tenant.** Default to the **Long Running Query (LRQ) API** at `POST /sdl/v2/api/queries` on the tenant's console URL. LRQ is the fastest, highest-limit, most reliable path for any programmatic use and supersedes both `/api/powerQuery` and the Deep Visibility `/dv/events/pq` endpoint (both deprecated; sunset Feb 15 2027). It is async, supports cursor paging to essentially unlimited rows, has a 100 req/sec per-account cap, and lets you parallelize across time slices. Reach for the Purple MCP `powerquery` tool only for a single quick exploratory check when no API client is already wired up. See "Running queries (LRQ API by default)" below and `references/lrq-api.md` for the canonical runner, body schema, auth, rate limits, and the gotchas that make it fail silently with 0 rows. If the user's request is clear and low-risk (read-only query), just run it; don't ask permission.
-4. **Iterate**: if the query errors or returns obviously wrong results, read the error, fix, rerun. If the query returns nothing, that is a legitimate result — don't blindly loosen it; check the time range and filter logic first.
+4. **Iterate**: if the query errors or returns obviously wrong results, read the error, fix, rerun. If the query returns nothing, that is a legitimate result, don't blindly loosen it; check the time range and filter logic first. If you ran via the Purple MCP `powerquery` tool and it **timed out** or returned a server error (common for anything past 24h or with wide initial filters), don't retry and don't shrink the range to fit the MCP budget - switch to the LRQ API path (see "Fallback" under Running queries below).
 5. **Explain the result briefly** and cite any fields you're relying on. If you used a non-obvious pattern (subquery, `savelookup`, `transpose`, `compare`), explain *why* you chose it.
 
 ## The grammar in one page
@@ -129,7 +129,23 @@ Once two tokens are in play the per-user rate cap stops being the bottleneck and
 
 **Canonical runner.** A working Python implementation (rate limiter, two-token round-robin, aggregate merge across slices) is kept at `/sessions/great-serene-euler/pq_30d_max_lrq_v2.py` and documented in `references/lrq-api.md`. Read that file before writing a new runner from scratch.
 
-**Quick one-shot exploration** (no API client wired up): the Purple MCP `mcp__purple-mcp__powerquery` tool still works for a one-off query. It wraps the same engine but with lower limits, tighter timeouts, and no parallelism. Pair it with `mcp__purple-mcp__get_timestamp_range(hours=24)` for ISO-8601 ranges, and `mcp__purple-mcp__purple_ai` when you need a starting-point query draft from natural language. Prefer LRQ for anything programmatic, multi-slice, over long windows, or producing results the user will use downstream.
+**Quick one-shot exploration** (no API client wired up): the Purple MCP `mcp__purple-mcp__powerquery` tool is fine for an interactive 24h hunt. It wraps the same engine but with lower limits, tighter timeouts, and no parallelism. Pair it with `mcp__purple-mcp__get_timestamp_range(hours=24)` for ISO-8601 ranges, and `mcp__purple-mcp__purple_ai` when you need a starting-point query draft from natural language. Prefer LRQ for anything programmatic, multi-slice, over long windows, or producing results the user will use downstream.
+
+**Fallback: when the Purple MCP `powerquery` tool times out or returns an error** (common for ranges > 24h, large aggregates, or wide initial filters), do NOT retry with a tighter time range as a first resort. Instead, re-run the same query through the LRQ API. The mgmt console API's `S1Client` already holds a valid JWT (`S1Client().api_token`); swap the prefix from `ApiToken` to `Bearer` and POST to the same tenant's `/sdl/v2/api/queries`. Canonical inline fallback:
+
+```python
+# Starting from the already-loaded S1Client used by the sentinelone-mgmt-console-api skill:
+from sentinelone_sdl_lrq import LRQClient, run_lrq_pq, parallel_run_roundrobin, slice_window
+# or import directly from /sessions/great-serene-euler/pq_30d_max_lrq_v2.py
+
+s1 = S1Client()                                # same client the mgmt skill uses
+jwt = s1.api_token                              # raw JWT - no prefix
+base = s1.base_url                              # e.g. https://usea1-purple.sentinelone.net
+lrq = LRQClient(base, jwt, label="fallback", rps=2.5)
+result = run_lrq_pq(lrq, query, start_iso, end_iso)   # launches, polls 1s, cancels
+```
+
+If the window is longer than a couple of days or the aggregate is heavy, slice it and use `parallel_run_roundrobin` with two clients built from two service-user JWTs (see `references/lrq-api.md`). The LRQ path handles anything the MCP times out on; there's no need to shrink the user's requested range to fit the MCP budget.
 
 ## Reference files — read as needed
 
